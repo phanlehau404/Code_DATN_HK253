@@ -1,0 +1,4 @@
+../Core/Src/bms_buttons.c:51:6:BMS_Buttons_Init	5
+../Core/Src/bms_buttons.c:72:6:BMS_Buttons_Tick1ms	11
+../Core/Src/bms_buttons.c:107:6:BMS_Buttons_TakePress	4
+../Core/Src/bms_buttons.c:124:15:BMS_Buttons_GetStableState	2

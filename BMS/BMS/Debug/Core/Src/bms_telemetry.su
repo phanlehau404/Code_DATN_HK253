@@ -1,0 +1,6 @@
+../Core/Src/bms_telemetry.c:29:16:BMS_Crc8	24	static
+../Core/Src/bms_telemetry.c:41:13:BMS_PutU16	16	static
+../Core/Src/bms_telemetry.c:47:19:BMS_Comm_Init	16	static
+../Core/Src/bms_telemetry.c:56:6:BMS_Comm_OnRxByte	24	static
+../Core/Src/bms_telemetry.c:85:6:BMS_Comm_OnUartError	16	static
+../Core/Src/bms_telemetry.c:93:6:BMS_Comm_Service	88	static,ignoring_inline_asm

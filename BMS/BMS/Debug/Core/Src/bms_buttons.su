@@ -1,0 +1,4 @@
+../Core/Src/bms_buttons.c:51:6:BMS_Buttons_Init	16	static
+../Core/Src/bms_buttons.c:72:6:BMS_Buttons_Tick1ms	24	static
+../Core/Src/bms_buttons.c:107:6:BMS_Buttons_TakePress	32	static,ignoring_inline_asm
+../Core/Src/bms_buttons.c:124:15:BMS_Buttons_GetStableState	16	static
