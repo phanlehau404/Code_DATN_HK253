@@ -11,12 +11,15 @@
  * NGUỒN SỐ LIỆU PV (UART ↔ STM32F103C8T6): ESP32 vẫn hỏi kit STM32F103C8T6 qua
  * Serial1 (115200 8N1, khung SOF/ID/LEN/PAYLOAD/CRC8) mỗi 2 s để giữ chẩn đoán
  * đường truyền và các số đo vin/iin/vout/iout/duty. Riêng solar_kw đang dùng số
- * mô phỏng 5–20 W phục vụ demo. Các trường pin và nhiệt độ cũng được mô phỏng.
+ * mô phỏng 5–20 W phục vụ demo. Dữ liệu pin/SOC/nhiệt độ được lấy từ STM32F103
+ * điều khiển BMS qua UART2 riêng.
  *
- * Đấu dây (chung GND, cả hai đều 3.3 V nên nối thẳng, không cần level shifter):
- *   ESP32 GPIO17 (TX) ── PB11 (USART3_RX) STM32
- *   ESP32 GPIO18 (RX) ── PB10 (USART3_TX) STM32
- *   GND ─────────────── GND
+ * Đấu dây (chung GND, mức logic 3.3 V):
+ *   Buck-boost: ESP32 GPIO17 (TX1) ── PB11 (USART3_RX) STM32 buck-boost
+ *               ESP32 GPIO18 (RX1) ── PB10 (USART3_TX) STM32 buck-boost
+ *   BMS:        ESP32 GPIO15 - D15 (TX2) ── PA3  (USART2_RX) STM32 BMS
+ *               ESP32 GPIO16 - D16 (RX2) ── PA2  (USART2_TX) STM32 BMS
+ *   GND ───────────────────────────── GND chung
  *
  * ĐIỂM PHÁT WIFI CỤC BỘ (SoftAP): thiết bị chạy WIFI_AP_STA — vừa nối uplink,
  * vừa tự phát mạng AP_SSID/AP_PASSWORD (secrets.h) để truy cập tại chỗ qua
@@ -204,6 +207,55 @@ static const unsigned long BUCKBOOST_POLL_INTERVAL_MS = 2000;
 static const unsigned long BUCKBOOST_REPLY_TIMEOUT_MS = 150;    // chờ trả lời
 static const unsigned long BUCKBOOST_STALE_MS = 60000;          // quá hạn -> coi mất link
 
+
+// ---------------------------------------------------------------------
+// Link UART tới STM32F103C8T6 điều khiển BMS (USART2 phía STM32, Serial2 ESP32).
+// Protocol khớp bms_telemetry.c:
+//   Request : [AA][00][03][01][seqLo][seqHi][CRC8]
+//   Response: [AA][02][21][91][seqLo][seqHi]...[flags][CRC8]
+// Một phản hồi chỉ được coi là kết nối thành công khi SOF/ID/LEN/CRC/type/seq
+// đều hợp lệ. Vì vậy thông báo "Connected successfully" phản ánh đúng việc
+// hai MCU đã trao đổi protocol, không chỉ việc UART đã được begin().
+// ---------------------------------------------------------------------
+static const int BMS_UART_TX_PIN = 15;        // ESP32 TX2 -> STM32 PA3  (USART2_RX)
+static const int BMS_UART_RX_PIN = 16;        // ESP32 RX2 <- STM32 PA2  (USART2_TX)
+static const uint32_t BMS_UART_BAUD = 115200;
+static const uint8_t BMS_NODE_ID = 0x02;
+static const uint8_t MSG_GET_BMS = 0x01;
+static const uint8_t MSG_BMS_RESULT = 0x91;
+static const uint8_t BMS_RESULT_LEN = 21;
+static const unsigned long BMS_POLL_INTERVAL_MS = 1000;
+static const unsigned long BMS_REPLY_TIMEOUT_MS = 220;
+static const unsigned long BMS_STALE_MS = 3000;
+static const unsigned long BMS_STATUS_REMINDER_MS = 10000;
+static const unsigned long BMS_TELEMETRY_LOG_MS = 5000;
+
+static const uint8_t BMS_FLAG_VOLTAGE_VALID = 0x01;
+static const uint8_t BMS_FLAG_TEMP_VALID = 0x02;
+static const uint8_t BMS_FLAG_SOC_VALID = 0x04;
+static const uint8_t BMS_FLAG_CURRENT_VALID = 0x08;
+static const uint8_t BMS_FLAG_FAULT_LATCHED = 0x10;
+
+struct BmsTelemetry {
+  uint16_t cell_mV[4] = {0, 0, 0, 0};
+  uint16_t pack_mV = 0;
+  int16_t current_mA = 0;        // STM32 convention: +discharge, -charge
+  uint16_t soc_centi_pct = 0;
+  int16_t pack_temp_cC = 0;
+  uint8_t output_enabled = 0;
+  uint8_t flags = 0;
+  uint32_t received_ms = 0;
+  bool connected = false;
+};
+
+BmsTelemetry bmsTlm;
+uint32_t bmsFrameOk = 0;
+uint32_t bmsFrameFail = 0;
+uint16_t bmsSequence = 0;
+unsigned long lastBmsStatusReminder = 0;
+unsigned long lastBmsTelemetryLog = 0;
+static portMUX_TYPE g_bmsTelemetryMux = portMUX_INITIALIZER_UNLOCKED;
+
 // Bố cục PHẢI khớp Telemetry_t bên STM32 (cả hai đều little-endian).
 struct __attribute__((packed)) BuckboostTelemetry {
   uint16_t vin_mV;        // điện áp tấm pin
@@ -270,7 +322,7 @@ struct BatteryReading {
   float tempC;    // °C
 };
 
-BatteryReading lastBatteryReading = {62.0f, 13.0f, 0.35f, 30.0f};
+BatteryReading lastBatteryReading = {0.0f, 0.0f, 0.0f, 0.0f};
 bool chargeEnabled = true;
 bool dischargeEnabled = true;
 const char *protectReason = "ok";
@@ -320,15 +372,13 @@ bool fwReported = false;
 unsigned long lastPublish = 0;
 unsigned long lastMqttAttempt = 0;
 bool wifiWasConnected = false;
-static const unsigned long PROTECT_INTERVAL_MS = 1000;
 
 
 /* =========================================================
  *  FREERTOS APPLICATION ARCHITECTURE
  * =========================================================
- * Current responsibilities are separated without adding new product
- * functions.  The buck-boost controller target is now STM32F103C8T6.
- * Future BMS UART / richer local-app services can be added without growing loop().
+ * Current responsibilities are separated without growing loop(). The two STM32
+ * controllers use independent UART links: Serial1 for buck-boost, Serial2 for BMS.
  *
  * Core 0: network-facing work
  *   - CloudTask       : Wi-Fi STA + AWS MQTT + telemetry + OTA dispatch
@@ -336,7 +386,7 @@ static const unsigned long PROTECT_INTERVAL_MS = 1000;
  *
  * Core 1: device/control-facing work
  *   - BuckboostTask : STM32F103C8T6 buck-boost/MPPT UART transaction
- *   - BMSTask       : current battery protection loop; future BMS owner
+ *   - BMSTask       : STM32F103 BMS UART + battery protection
  *
  * MQTT ownership rule: ONLY CloudTask may call PubSubClient APIs.  This is
  * important because PubSubClient is not designed for concurrent access.
@@ -543,20 +593,34 @@ float simulatedLoadW() {
          / 10.0f;
 }
 
-// Đây chỉ là nguồn dữ liệu BMS mẫu hiện tại. Chỉ BMSTask gọi hàm này trong
-// runtime. Khi thêm STM32-BMS, KHÔNG cho CloudTask/LocalServerTask truy cập UART
-// BMS trực tiếp; BmsTask sẽ cập nhật battery snapshot thay thế.
+static BmsTelemetry loadBmsTelemetrySnapshot();
+
+static BmsTelemetry loadBmsTelemetrySnapshot() {
+  BmsTelemetry out;
+  portENTER_CRITICAL(&g_bmsTelemetryMux);
+  out = bmsTlm;
+  portEXIT_CRITICAL(&g_bmsTelemetryMux);
+  return out;
+}
+
+// Chuyển telemetry STM32-BMS sang kiểu BatteryReading mà phần bảo vệ/cloud
+// hiện tại đang dùng. STM32 quy ước +I=xả, -I=sạc; ESP32 hiện tại quy ước
+// +I=sạc, -I=xả, do đó phải đảo dấu đúng một lần tại đây.
 BatteryReading readBattery() {
-  BatteryReading r;
-  // Giữ nguyên SOC mẫu và các cơ chế bảo vệ/relay; chỉ thay các đại lượng mà
-  // BMS demo cần dao động. Dòng trong struct/API có đơn vị A: 0.2–0.5 A chính
-  // là 200–500 mA.
-  r.soc = 62.0f;
-  r.voltage = roundf(simulatedWave(12.0f, 14.0f, 90000UL) * 100.0f) / 100.0f;
-  r.current = roundf(simulatedWave(0.2f, 0.5f, 30000UL, 1.20f) * 1000.0f)
-              / 1000.0f;
-  r.tempC = roundf(simulatedWave(25.0f, 35.0f, 180000UL, 2.40f) * 10.0f)
-            / 10.0f;
+  const BmsTelemetry tlm = loadBmsTelemetrySnapshot();
+  BatteryReading r = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  if (!tlm.connected || (millis() - tlm.received_ms) > BMS_STALE_MS)
+    return r;
+
+  if (tlm.flags & BMS_FLAG_SOC_VALID)
+    r.soc = tlm.soc_centi_pct / 100.0f;
+  if (tlm.flags & BMS_FLAG_VOLTAGE_VALID)
+    r.voltage = tlm.pack_mV / 1000.0f;
+  if (tlm.flags & BMS_FLAG_CURRENT_VALID)
+    r.current = -(tlm.current_mA / 1000.0f);
+  if (tlm.flags & BMS_FLAG_TEMP_VALID)
+    r.tempC = tlm.pack_temp_cC / 100.0f;
   return r;
 }
 
@@ -641,7 +705,7 @@ static void queueBmsConfigAck(const char *configId, uint64_t configVersion,
 }
 
 // ---------------------------------------------------------------------
-// UART STM32
+// UART STM32 buck-boost + BMS
 // ---------------------------------------------------------------------
 
 // CRC8 poly 0x07, init 0x00 — cùng thuật toán với bảng CRC bên STM32.
@@ -765,6 +829,167 @@ void pollBuckboost() {
   portEXIT_CRITICAL(&g_pvStateMux);
 }
 
+static uint16_t getU16LE(const uint8_t *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static int16_t getI16LE(const uint8_t *p) {
+  return (int16_t)getU16LE(p);
+}
+
+static void bmsSendRequest(uint16_t seq) {
+  uint8_t f[7];
+  f[0] = FRAME_SOF;
+  f[1] = MASTER_ID;
+  f[2] = 3;
+  f[3] = MSG_GET_BMS;
+  f[4] = (uint8_t)(seq & 0xFFu);
+  f[5] = (uint8_t)(seq >> 8);
+  f[6] = crc8(&f[1], 5);
+
+  while (Serial2.available()) Serial2.read();
+  Serial2.write(f, sizeof(f));
+  Serial2.flush();
+}
+
+static bool bmsReadFrame(uint8_t *out, uint8_t *outLen, uint8_t *from,
+                         unsigned long timeoutMs) {
+  uint8_t buf[MAX_PAYLOAD + 4];
+  uint16_t n = 0;
+  const unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    if (!Serial2.available()) {
+      delay(1);
+      continue;
+    }
+
+    const uint8_t b = (uint8_t)Serial2.read();
+    if (n == 0 && b != FRAME_SOF) continue;
+    buf[n++] = b;
+
+    if (n == 2 && buf[1] == MASTER_ID) {
+      n = 0;
+      continue;
+    }
+
+    if (n >= 3) {
+      const uint8_t plen = buf[2];
+      if (plen > MAX_PAYLOAD) {
+        n = 0;
+        continue;
+      }
+      if (n == (uint16_t)plen + 4u) {
+        if (crc8(&buf[1], (uint16_t)(plen + 2u)) != buf[plen + 3u]) {
+          n = 0;
+          continue;
+        }
+        memcpy(out, &buf[3], plen);
+        *outLen = plen;
+        *from = buf[1];
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool parseBmsResult(const uint8_t *payload, uint8_t len,
+                           uint16_t expectedSeq, BmsTelemetry &out) {
+  if (!payload || len != BMS_RESULT_LEN || payload[0] != MSG_BMS_RESULT)
+    return false;
+
+  const uint16_t seq = getU16LE(&payload[1]);
+  if (seq != expectedSeq) return false;
+
+  for (uint8_t i = 0; i < 4; ++i)
+    out.cell_mV[i] = getU16LE(&payload[3 + 2 * i]);
+  out.pack_mV = getU16LE(&payload[11]);
+  out.current_mA = getI16LE(&payload[13]);
+  out.soc_centi_pct = getU16LE(&payload[15]);
+  out.pack_temp_cC = getI16LE(&payload[17]);
+  out.output_enabled = payload[19];
+  out.flags = payload[20];
+
+  if (out.soc_centi_pct > 10000u) return false;
+  out.received_ms = millis();
+  out.connected = true;
+  return true;
+}
+
+static void logBmsTelemetryIfDue(const BmsTelemetry &tlm) {
+  const unsigned long now = millis();
+  if (now - lastBmsTelemetryLog < BMS_TELEMETRY_LOG_MS) return;
+  lastBmsTelemetryLog = now;
+
+  Serial.printf(
+      "[BMS] SOC=%.2f%% | Vpack=%.3fV | I=%.3fA(STM32 sign) | T=%.2fC | "
+      "OUT=%u | flags=0x%02X | cells=[%.3f %.3f %.3f %.3f]V\n",
+      tlm.soc_centi_pct / 100.0f,
+      tlm.pack_mV / 1000.0f,
+      tlm.current_mA / 1000.0f,
+      tlm.pack_temp_cC / 100.0f,
+      (unsigned)tlm.output_enabled,
+      (unsigned)tlm.flags,
+      tlm.cell_mV[0] / 1000.0f,
+      tlm.cell_mV[1] / 1000.0f,
+      tlm.cell_mV[2] / 1000.0f,
+      tlm.cell_mV[3] / 1000.0f);
+}
+
+static void pollBms() {
+  uint8_t payload[MAX_PAYLOAD];
+  uint8_t len = 0;
+  uint8_t from = 0xFF;
+  const uint16_t seq = ++bmsSequence;
+  const BmsTelemetry before = loadBmsTelemetrySnapshot();
+  const bool wasConnected = before.connected &&
+                            (millis() - before.received_ms <= BMS_STALE_MS);
+
+  bmsSendRequest(seq);
+
+  BmsTelemetry parsed;
+  if (bmsReadFrame(payload, &len, &from, BMS_REPLY_TIMEOUT_MS) &&
+      from == BMS_NODE_ID && parseBmsResult(payload, len, seq, parsed)) {
+    portENTER_CRITICAL(&g_bmsTelemetryMux);
+    bmsTlm = parsed;
+    portEXIT_CRITICAL(&g_bmsTelemetryMux);
+
+    ++bmsFrameOk;
+    if (!wasConnected) {
+      Serial.println("[BMS] Connected successfully - STM32F103 BMS UART link is active");
+      Serial.printf("[BMS] node=0x%02X, baud=%lu, valid frames=%lu\n",
+                    BMS_NODE_ID, (unsigned long)BMS_UART_BAUD,
+                    (unsigned long)bmsFrameOk);
+    }
+    logBmsTelemetryIfDue(parsed);
+    return;
+  }
+
+  ++bmsFrameFail;
+  const unsigned long now = millis();
+  BmsTelemetry current = loadBmsTelemetrySnapshot();
+  const bool stale = !current.connected ||
+                     (now - current.received_ms > BMS_STALE_MS);
+
+  if (stale && current.connected) {
+    portENTER_CRITICAL(&g_bmsTelemetryMux);
+    bmsTlm.connected = false;
+    portEXIT_CRITICAL(&g_bmsTelemetryMux);
+    Serial.printf("[BMS] Connection lost - no valid response for > %lu ms\n",
+                  BMS_STALE_MS);
+  }
+
+  if (now - lastBmsStatusReminder >= BMS_STATUS_REMINDER_MS) {
+    lastBmsStatusReminder = now;
+    const BmsTelemetry state = loadBmsTelemetrySnapshot();
+    if (!state.connected) {
+      Serial.printf("[BMS] Waiting for STM32F103 BMS... fail=%lu, last from=0x%02X len=%u\n",
+                    (unsigned long)bmsFrameFail, from, len);
+    }
+  }
+}
+
 void loadBatteryConfig() {
   BatteryConfig cfg;
   portENTER_CRITICAL(&g_batteryStateMux);
@@ -816,39 +1041,65 @@ void writeProtectRelays() {
 }
 
 void applyProtection() {
+  const BmsTelemetry tlm = loadBmsTelemetrySnapshot();
+  const bool bmsFresh = tlm.connected &&
+                        (millis() - tlm.received_ms <= BMS_STALE_MS);
+  const bool protectionDataValid =
+      (tlm.flags & (BMS_FLAG_VOLTAGE_VALID |
+                    BMS_FLAG_CURRENT_VALID |
+                    BMS_FLAG_SOC_VALID)) ==
+      (BMS_FLAG_VOLTAGE_VALID |
+       BMS_FLAG_CURRENT_VALID |
+       BMS_FLAG_SOC_VALID);
+  const bool bmsFaultLatched = (tlm.flags & BMS_FLAG_FAULT_LATCHED) != 0;
   const BatteryReading r = readBattery();
 
   portENTER_CRITICAL(&g_batteryStateMux);
   lastBatteryReading = r;
 
-  if (r.current >= batteryCfg.maxCurrent) {
+  // Fail-safe: mất BMS / dữ liệu sensor hết hạn / BMS đã latch fault thì ESP32
+  // ngắt cả hai relay. STM32 BMS vẫn có lớp bảo vệ độc lập của chính nó.
+  if (!bmsFresh) {
     chargeEnabled = false;
-    protectReason = "overcurrent";
-  } else if (r.voltage >= batteryCfg.maxVoltage) {
-    chargeEnabled = false;
-    protectReason = "overvoltage";
-  } else if (r.soc >= batteryCfg.maxSoc) {
-    chargeEnabled = false;
-    protectReason = "full";
-  } else if (!chargeEnabled) {
-    const bool voltOk = r.voltage < batteryCfg.maxVoltage - VOLT_CHARGE_RESUME_MARGIN;
-    const bool socOk = r.soc < batteryCfg.maxSoc - SOC_CHARGE_RESUME_MARGIN;
-    const bool currentOk = r.current < batteryCfg.maxCurrent - CURRENT_CHARGE_RESUME_MARGIN;
-    if (voltOk && socOk && currentOk) chargeEnabled = true;
-  }
-
-  if (batteryCfg.deepDischargeProtect && r.soc <= batteryCfg.minSoc) {
     dischargeEnabled = false;
-    protectReason = "deep_discharge";
-  } else if (!dischargeEnabled) {
-    if (r.soc > batteryCfg.minSoc + SOC_DISCHARGE_RESUME_MARGIN)
-      dischargeEnabled = true;
-  }
+    protectReason = "bms_offline";
+  } else if (!protectionDataValid) {
+    chargeEnabled = false;
+    dischargeEnabled = false;
+    protectReason = "bms_invalid";
+  } else if (bmsFaultLatched) {
+    chargeEnabled = false;
+    dischargeEnabled = false;
+    protectReason = "bms_fault";
+  } else {
+    if (r.current >= batteryCfg.maxCurrent) {
+      chargeEnabled = false;
+      protectReason = "overcurrent";
+    } else if (r.voltage >= batteryCfg.maxVoltage) {
+      chargeEnabled = false;
+      protectReason = "overvoltage";
+    } else if (r.soc >= batteryCfg.maxSoc) {
+      chargeEnabled = false;
+      protectReason = "full";
+    } else if (!chargeEnabled) {
+      const bool voltOk = r.voltage < batteryCfg.maxVoltage - VOLT_CHARGE_RESUME_MARGIN;
+      const bool socOk = r.soc < batteryCfg.maxSoc - SOC_CHARGE_RESUME_MARGIN;
+      const bool currentOk = r.current < batteryCfg.maxCurrent - CURRENT_CHARGE_RESUME_MARGIN;
+      if (voltOk && socOk && currentOk) chargeEnabled = true;
+    }
 
-  if (chargeEnabled && dischargeEnabled) protectReason = "ok";
+    if (batteryCfg.deepDischargeProtect && r.soc <= batteryCfg.minSoc) {
+      dischargeEnabled = false;
+      protectReason = "deep_discharge";
+    } else if (!dischargeEnabled) {
+      if (r.soc > batteryCfg.minSoc + SOC_DISCHARGE_RESUME_MARGIN)
+        dischargeEnabled = true;
+    }
+
+    if (chargeEnabled && dischargeEnabled) protectReason = "ok";
+  }
 
   portEXIT_CRITICAL(&g_batteryStateMux);
-
   writeProtectRelays();
 }
 
@@ -1925,11 +2176,12 @@ static void BMSTask(void *parameter) {
   (void)parameter;
 
   for (;;) {
+    /* Serial2 has exactly one runtime owner: BMSTask. */
+    pollBms();
     applyProtection();
 
-    /* A cloud battery_config command notifies this task so the new limits are
-     * applied immediately; otherwise it wakes periodically as before. */
-    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PROTECT_INTERVAL_MS));
+    /* Cloud battery_config can wake this task early; otherwise poll BMS at 1 Hz. */
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BMS_POLL_INTERVAL_MS));
   }
 }
 
@@ -2019,12 +2271,18 @@ void setup() {
   loadBootCount();
   Serial.printf("boot #%u\n", bootCount);
 
-  /* One-time peripheral initialization. Runtime Serial1 access belongs only
-   * to BuckboostTask after the scheduler starts. */
-  Serial1.begin(BUCKBOOST_UART_BAUD, SERIAL_8N1, BUCKBOOST_UART_RX_PIN, BUCKBOOST_UART_TX_PIN);
+  /* One-time peripheral initialization. Runtime ownership after scheduler:
+   * Serial1 -> BuckboostTask, Serial2 -> BMSTask. */
+  Serial1.begin(BUCKBOOST_UART_BAUD, SERIAL_8N1,
+                BUCKBOOST_UART_RX_PIN, BUCKBOOST_UART_TX_PIN);
+  Serial2.begin(BMS_UART_BAUD, SERIAL_8N1,
+                BMS_UART_RX_PIN, BMS_UART_TX_PIN);
+  Serial.printf("[BMS] UART2 initialized: %lu baud, TX=GPIO%d, RX=GPIO%d\n",
+                (unsigned long)BMS_UART_BAUD, BMS_UART_TX_PIN, BMS_UART_RX_PIN);
+  Serial.println("[BMS] Waiting for STM32F103 BMS...");
 
   loadBatteryConfig();
-  applyProtection();  // establish relay state before background tasks start
+  applyProtection();  // starts fail-safe OFF until first valid BMS frame
   const bool hasWiFiConfig = loadWiFiCredentials();
   Serial.printf("WiFi uplink config: %s\n",
                 hasWiFiConfig ? "loaded from NVS" : "not configured");
